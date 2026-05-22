@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>クイズ管理画面 (ホスト)</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; background-color: #f4f4f9; }
+        .screen { display: none; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .screen.active { display: block; }
+        .player-card { border: 1px solid #ccc; padding: 10px; margin: 5px; display: inline-block; text-align: center; width: 150px; border-radius: 8px; background: #fff;}
+        .answered { background-color: #d4edda; border-color: #c3e6cb; }
+        input[type="text"], input[type="number"] { padding: 8px; margin: 5px; width: 80%; }
+        button { padding: 10px 20px; margin: 10px 0; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 4px;}
+        button:hover { background: #0056b3; }
+        #qrcode { margin: 20px 0; }
+    </style>
+</head>
+<body>
+
+    <div id="screen-setup" class="screen active">
+        <h2>問題設定</h2>
+        <p>通信サーバーに接続中...</p>
+    </div>
+
+    <div id="screen-waiting" class="screen">
+        <h2>参加者待機中</h2>
+        <p>参加人数: <span id="player-count">0</span>人</p>
+        <div id="qrcode"></div>
+        <p>以下のURLでも参加できます:</p>
+        <a id="join-url" target="_blank"></a>
+        <div id="waiting-players" style="margin-top: 20px; font-weight: bold;"></div>
+        <br><button onclick="startFirstQuestion()">ゲーム開始 (第1問へ)</button>
+    </div>
+
+    <div id="screen-play" class="screen">
+        <h2 id="current-question-text">第X問</h2>
+        <p>状態: <strong id="game-status-text">回答受付中</strong></p>
+        
+        <div style="margin: 20px 0;">
+            <button id="btn-close" onclick="closeAnswers()">解答を締め切る</button>
+            <button id="btn-reveal" style="display:none;" onclick="revealAnswers()">正解・スコア発表</button>
+            <button id="btn-next" style="display:none;" onclick="nextQuestion()">次の問題へ</button>
+            <button id="btn-finish" style="display:none;" onclick="showFinalResult()">最終結果発表</button>
+        </div>
+        
+        <h3 id="correct-answer-display" style="color: red; display: none;"></h3>
+        <div id="players-board"></div>
+    </div>
+
+    <div id="screen-result" class="screen">
+        <h2>最終結果 (スコアが低い順・0に近いほど勝ち)</h2>
+        <div id="ranking-board"></div>
+    </div>
+
+<script>
+    // 通信用の設定
+    const peer = new Peer(); // ランダムなホストIDを生成
+    let hostId = "";
+    let players = {}; // { プレイヤーID: { name, score, currentAnswer, conn(通信オブジェクト) } }
+    
+    // ゲームの状態
+    let questions = [];
+    let currentQIndex = 0;
+    let gameState = 'waiting'; // waiting, playing, closed, finished
+    let isRevealed = false;
+
+    // 通信準備完了時
+    peer.on('open', (id) => {
+        hostId = id;
+        setupInitialScreen();
+    });
+
+    // 参加者からの接続を受信した時
+    peer.on('connection', (conn) => {
+        conn.on('data', (data) => {
+            if (data.type === 'join') {
+                // 新規参加または再接続
+                if (!players[data.playerId]) {
+                    players[data.playerId] = { name: data.name, score: 0, currentAnswer: "" };
+                } else {
+                    players[data.playerId].name = data.name; // 名前更新
+                }
+                players[data.playerId].conn = conn; // 通信経路を保存
+                updatePlayersBoard();
+                broadcastStateTo(conn); // 現在の状態をこの参加者に送る
+            } 
+            else if (data.type === 'answer' && gameState === 'playing') {
+                // 回答を受信
+                if(players[data.playerId]) {
+                    players[data.playerId].currentAnswer = data.answer;
+                    updatePlayersBoard();
+                }
+            }
+        });
+    });
+
+    // 全参加者に現在の状態を一斉送信する
+    function broadcastState() {
+        for (let pid in players) {
+            if (players[pid].conn) {
+                broadcastStateTo(players[pid].conn);
+            }
+        }
+    }
+    
+    // 特定の参加者に状態を送信する
+    function broadcastStateTo(conn) {
+        conn.send({
+            state: gameState,
+            questionIndex: currentQIndex
+        });
+    }
+
+    // --- 画面表示の制御 ---
+    function setupInitialScreen() {
+        const setupDiv = document.getElementById('screen-setup');
+        setupDiv.innerHTML = `
+            <h2>問題設定</h2>
+            <div id="questions-container"></div>
+            <button onclick="addQuestionInput()">＋ 問題を追加</button><br>
+            <button onclick="startGameSetup()">この設定でルームを開く</button>
+        `;
+        addQuestionInput();
+    }
+
+    function addQuestionInput() {
+        const div = document.createElement('div');
+        div.innerHTML = `<input type="text" placeholder="問題文" class="q-text"> 
+                         <input type="number" placeholder="正解の数字" class="q-ans">`;
+        document.getElementById('questions-container').appendChild(div);
+    }
+
+    function startGameSetup() {
+        const texts = document.querySelectorAll('.q-text');
+        const ans = document.querySelectorAll('.q-ans');
+        questions = [];
+        texts.forEach((t, i) => {
+            if(t.value && ans[i].value) {
+                questions.push({ text: t.value, answer: Number(ans[i].value) });
+            }
+        });
+        if(questions.length === 0) return alert('問題を1つ以上設定してください。');
+
+        // URL生成 (ホストIDを付与)
+        let playerUrl = window.location.href.replace('host.html', 'player.html');
+        // github.io などのルートディレクトリ対策
+        if (!playerUrl.includes('player.html')) playerUrl += 'player.html';
+        playerUrl += `?host=${hostId}`;
+
+        new QRCode(document.getElementById("qrcode"), playerUrl);
+        document.getElementById('join-url').href = playerUrl;
+        document.getElementById('join-url').innerText = playerUrl;
+
+        switchScreen('screen-waiting');
+    }
+
+    function switchScreen(id) {
+        document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+        document.getElementById(id).classList.add('active');
+    }
+
+    function updatePlayersBoard() {
+        const count = Object.keys(players).length;
+        document.getElementById('player-count').innerText = count;
+
+        const board = document.getElementById('players-board');
+        const waitBoard = document.getElementById('waiting-players');
+        board.innerHTML = ''; waitBoard.innerHTML = '';
+
+        for (let pid in players) {
+            const p = players[pid];
+            
+            // 待機画面用
+            const waitDiv = document.createElement('span');
+            waitDiv.innerText = p.name + ' / ';
+            waitBoard.appendChild(waitDiv);
+
+            // プレイ画面用 (フリップ)
+            const pCard = document.createElement('div');
+            pCard.className = 'player-card ' + (p.currentAnswer !== "" ? 'answered' : '');
+            let answerText = "考え中...";
+            
+            if (p.currentAnswer !== "") {
+                answerText = isRevealed ? p.currentAnswer : "回答済み";
+            }
+            
+            pCard.innerHTML = `
+                <h4>${p.name}</h4>
+                <p>得点差: ${p.score}</p>
+                <h2>${answerText}</h2>
+            `;
+            board.appendChild(pCard);
+        }
+    }
+
+    function startFirstQuestion() {
+        currentQIndex = 0;
+        setQuestionState();
+        switchScreen('screen-play');
+    }
+
+    function setQuestionState() {
+        gameState = 'playing';
+        isRevealed = false;
+        document.getElementById('btn-close').style.display = 'inline-block';
+        document.getElementById('btn-reveal').style.display = 'none';
+        document.getElementById('btn-next').style.display = 'none';
+        document.getElementById('btn-finish').style.display = 'none';
+        document.getElementById('correct-answer-display').style.display = 'none';
+        document.getElementById('game-status-text').innerText = '回答受付中';
+        document.getElementById('current-question-text').innerText = `第${currentQIndex + 1}問: ${questions[currentQIndex].text}`;
+
+        // 全員の回答をリセット
+        for(let pid in players) { players[pid].currentAnswer = ""; }
+        updatePlayersBoard();
+        broadcastState();
+    }
+
+    function closeAnswers() {
+        gameState = 'closed';
+        document.getElementById('game-status-text').innerText = '回答締め切り (正解発表待ち)';
+        document.getElementById('btn-close').style.display = 'none';
+        document.getElementById('btn-reveal').style.display = 'inline-block';
+        broadcastState();
+    }
+
+    function revealAnswers() {
+        isRevealed = true;
+        const correctAns = questions[currentQIndex].answer;
+        document.getElementById('correct-answer-display').innerText = `正解は「${correctAns}」です！`;
+        document.getElementById('correct-answer-display').style.display = 'block';
+
+        // スコア計算 (正解との絶対値を加算)
+        for (let pid in players) {
+            const p = players[pid];
+            if (p.currentAnswer !== "") {
+                const diff = Math.abs(Number(p.currentAnswer) - correctAns);
+                p.score += diff;
+            }
+        }
+        
+        updatePlayersBoard();
+        document.getElementById('btn-reveal').style.display = 'none';
+        if (currentQIndex < questions.length - 1) {
+            document.getElementById('btn-next').style.display = 'inline-block';
+        } else {
+            document.getElementById('btn-finish').style.display = 'inline-block';
+        }
+    }
+
+    function nextQuestion() {
+        currentQIndex++;
+        setQuestionState();
+    }
+
+    function showFinalResult() {
+        gameState = 'finished';
+        broadcastState();
+        switchScreen('screen-result');
+        
+        // ランキング並び替え (スコア低い順)
+        const sorted = Object.values(players).sort((a, b) => a.score - b.score);
+        let html = '<ol>';
+        sorted.forEach(p => {
+            html += `<li><h3>${p.name} : ${p.score} (差分)</h3></li>`;
+        });
+        html += '</ol>';
+        document.getElementById('ranking-board').innerHTML = html;
+    }
+</script>
+</body>
+</html>
